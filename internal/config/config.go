@@ -78,6 +78,7 @@ type LogEntry struct {
 	UserID    int64     `toml:"user_id"`
 	Username  string    `toml:"username"`
 	Timestamp time.Time `toml:"timestamp"`
+	Status    string    `toml:"status"`
 }
 
 type AdminLog struct {
@@ -226,7 +227,56 @@ func (m *Manager) Update(fn func(*Config)) error {
 	return m.saveLocked()
 }
 
+func (m *Manager) cleanupLocked() {
+	now := time.Now()
+
+	// 1. Remove expired accesses
+	var activeAccesses []Access
+	for _, a := range m.cfg.Accesses {
+		if !a.ExpiresAt.IsZero() && a.ExpiresAt.Before(now) {
+			continue
+		}
+		activeAccesses = append(activeAccesses, a)
+	}
+	m.cfg.Accesses = activeAccesses
+
+	// 2. Remove orphaned users
+	referencedUsers := make(map[int64]bool)
+	referencedUsers[m.cfg.MasterAdminID] = true
+	for _, a := range m.cfg.Accesses {
+		referencedUsers[a.UserID] = true
+		referencedUsers[a.CreatedBy] = true
+	}
+	for _, adm := range m.cfg.Admins {
+		referencedUsers[adm.UserID] = true
+		referencedUsers[adm.CreatedBy] = true
+	}
+
+	var activeUsers []User
+	for _, u := range m.cfg.Users {
+		if referencedUsers[u.TelegramID] {
+			activeUsers = append(activeUsers, u)
+		}
+	}
+	m.cfg.Users = activeUsers
+
+	// 3. Enforce ring buffer size 10 for audit_logs
+	for phone, logs := range m.cfg.AuditLogs {
+		if len(logs) > 10 {
+			m.cfg.AuditLogs[phone] = logs[len(logs)-10:]
+		}
+	}
+
+	// 4. Enforce ring buffer size 10 for admin_logs
+	if len(m.cfg.AdminLogs) > 10 {
+		m.cfg.AdminLogs = m.cfg.AdminLogs[len(m.cfg.AdminLogs)-10:]
+	}
+}
+
 func (m *Manager) saveLocked() error {
+	// Call cleanup at the BEGINNING of saveLocked()
+	m.cleanupLocked()
+
 	// Atomic write: write to temp file then rename
 	tmpPath := m.path + ".tmp"
 	f, err := os.Create(tmpPath)
@@ -262,7 +312,7 @@ func (m *Manager) AddLog(phone string, entry LogEntry) error {
 func (m *Manager) AddAdminLog(log AdminLog) error {
 	return m.Update(func(cfg *Config) {
 		cfg.AdminLogs = append(cfg.AdminLogs, log)
-		if len(cfg.AdminLogs) > 100 {
+		if len(cfg.AdminLogs) > 10 {
 			cfg.AdminLogs = cfg.AdminLogs[len(cfg.AdminLogs)-100:]
 		}
 	})

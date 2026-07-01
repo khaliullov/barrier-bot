@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -172,15 +173,27 @@ func (b *Bot) handleOpenBarrier(chatID int64, messageID int, userID int64, usern
 	b.barrierStatuses.Store(phone, config.StatusOpening)
 	b.showBarrierControl(chatID, userID, messageID, phone)
 
+	// Structured logging for journald visibility
+	log.Printf("BARRIER_OPEN_REQUEST user_id=%d username=%s barrier=%s", userID, username, phone)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
 	err := b.sipClient.OpenBarrier(ctx, phone)
 
 	if err != nil {
+		log.Printf("BARRIER_OPEN_ERROR user_id=%d username=%s barrier=%s error=%q", userID, username, phone, err.Error())
 		b.barrierStatuses.Store(phone, config.StatusError)
 		b.barrierLogs.Store(phone, fmt.Sprintf("❌ Ошибка: %v", err))
+
+		b.store.AddLog(phone, config.LogEntry{
+			UserID:    userID,
+			Username:  username,
+			Timestamp: time.Now(),
+			Status:    fmt.Sprintf("Error: %v", err),
+		})
 	} else {
+		log.Printf("BARRIER_OPEN_SUCCESS user_id=%d username=%s barrier=%s", userID, username, phone)
 		b.barrierStatuses.Store(phone, config.StatusOpened)
 		b.barrierLogs.Store(phone, fmt.Sprintf("✅ Последний раз открыто %s в %s", username, time.Now().Format("15:04")))
 
@@ -188,6 +201,7 @@ func (b *Bot) handleOpenBarrier(chatID int64, messageID int, userID int64, usern
 			UserID:    userID,
 			Username:  username,
 			Timestamp: time.Now(),
+			Status:    "Opened",
 		})
 	}
 
