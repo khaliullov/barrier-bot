@@ -94,6 +94,7 @@ type Config struct {
 	TelegramToken string `toml:"telegram_token"`
 	MasterAdminID int64  `toml:"master_admin_id"`
 	Debug         bool   `toml:"debug"`
+	ForceIPv6     bool   `toml:"force_ipv6"`
 
 	SIP SIPConfig `toml:"sip"`
 

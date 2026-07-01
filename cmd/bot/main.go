@@ -57,7 +57,7 @@ func main() {
 	store := storage.NewStore(cfgManager)
 
 	// 4. Initialize Bot
-	telegramBot, err := bot.NewBot(cfg.TelegramToken, store, sipClient)
+	telegramBot, err := bot.NewBot(cfg.TelegramToken, store, sipClient, cfg.ForceIPv6)
 	if err != nil {
 		log.Fatalf("Failed to initialize Telegram bot: %v", err)
 	}

@@ -53,7 +53,7 @@ type Bot struct {
 	openingMu       sync.Map // barrierPhone -> *sync.Mutex (для предотвращения одновременных открытий)
 }
 
-func NewBot(token string, store *storage.Store, sipClient *sip.Client) (*Bot, error) {
+func NewBot(token string, store *storage.Store, sipClient *sip.Client, forceIPv6 bool) (*Bot, error) {
 	dialer := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
@@ -61,7 +61,10 @@ func NewBot(token string, store *storage.Store, sipClient *sip.Client) (*Bot, er
 
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return dialer.DialContext(ctx, "tcp4", addr)
+			if forceIPv6 {
+				return dialer.DialContext(ctx, "tcp6", addr)
+			}
+			return dialer.DialContext(ctx, network, addr)
 		},
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
