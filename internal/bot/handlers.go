@@ -159,12 +159,15 @@ func (b *Bot) handleOpenBarrier(chatID int64, messageID int, userID int64, usern
 	mRaw, _ := b.openingMu.LoadOrStore(phone, &sync.Mutex{})
 	mu := mRaw.(*sync.Mutex)
 	if !mu.TryLock() {
+		b.editMessage(chatID, messageID, "⏳ Шлагбаум уже открывается другим пользователем...")
 		return
 	}
 	defer mu.Unlock()
 
 	if lastOpen, ok := b.cooldowns.Load(phone); ok {
 		if time.Since(lastOpen.(time.Time)) < 5*time.Second {
+			remaining := 5 - int(time.Since(lastOpen.(time.Time)).Seconds())
+			b.editMessage(chatID, messageID, fmt.Sprintf("⏳ Подождите %d сек...", remaining))
 			return
 		}
 	}
@@ -195,7 +198,7 @@ func (b *Bot) handleOpenBarrier(chatID int64, messageID int, userID int64, usern
 	} else {
 		log.Printf("BARRIER_OPEN_SUCCESS user_id=%d username=%s barrier=%s", userID, username, phone)
 		b.barrierStatuses.Store(phone, config.StatusOpened)
-		b.barrierLogs.Store(phone, fmt.Sprintf("✅ Последний раз открыто %s в %s", username, time.Now().Format("15:04")))
+		b.barrierLogs.Store(phone, fmt.Sprintf("✅ Последний раз открыто %s в %s", username, time.Now().Format("02.01 15:04")))
 
 		b.store.AddLog(phone, config.LogEntry{
 			UserID:    userID,
@@ -897,7 +900,7 @@ func (b *Bot) showAuditLogs(chatID int64, messageID int) {
 	for i := len(logs) - 1; i >= start; i-- {
 		l := logs[i]
 		text += fmt.Sprintf("🕒 %s\nАдмин ID: %d\nДействие: %s\nЦель: %s\nШлагбаум: %s\n\n",
-			l.Timestamp.Format("15:04"), l.AdminID, l.Action, l.Target, l.Barrier)
+			l.Timestamp.Format("02.01 15:04"), l.AdminID, l.Action, l.Target, l.Barrier)
 	}
 
 	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)

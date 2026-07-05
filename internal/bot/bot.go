@@ -96,7 +96,7 @@ func NewBot(token string, store *storage.Store, sipClient *sip.Client, forceIPv6
 		if len(logs) > 0 {
 			lastEntry := logs[len(logs)-1]
 			if lastEntry.Status == "Opened" {
-				b.barrierLogs.Store(br.Phone, fmt.Sprintf("✅ Последний раз открыто %s в %s", lastEntry.Username, lastEntry.Timestamp.Format("15:04")))
+				b.barrierLogs.Store(br.Phone, fmt.Sprintf("✅ Последний раз открыто %s в %s", lastEntry.Username, lastEntry.Timestamp.Format("02.01 15:04")))
 			} else if strings.HasPrefix(lastEntry.Status, "Error: ") {
 				errMsg := strings.TrimPrefix(lastEntry.Status, "Error: ")
 				b.barrierLogs.Store(br.Phone, fmt.Sprintf("❌ Ошибка: %s", errMsg))
