@@ -1,12 +1,9 @@
 package bot
 
 import (
-	"context"
 	"fmt"
-	"log"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -35,6 +32,37 @@ func (b *Bot) handleCallback(query *tgbotapi.CallbackQuery) {
 	case data == "barrier_list":
 		b.showBarrierList(chatID, userID, messageID)
 
+	case data == "request_access_list":
+		b.showRequestBarrierList(chatID, userID, messageID)
+
+	case strings.HasPrefix(data, "req_bar_"):
+		barrierID := strings.TrimPrefix(data, "req_bar_")
+		b.showRequestAdminList(chatID, userID, messageID, barrierID)
+
+	case strings.HasPrefix(data, "req_send_"):
+		parts := strings.Split(data, "_")
+		if len(parts) == 4 {
+			barrierID := parts[2]
+			adminID, _ := strconv.ParseInt(parts[3], 10, 64)
+			b.handleSendAccessRequest(chatID, userID, messageID, barrierID, adminID)
+		}
+
+	case strings.HasPrefix(data, "appr_guest_"):
+		requestID := strings.TrimPrefix(data, "appr_guest_")
+		b.handleApproveRequest(chatID, userID, messageID, requestID, config.AccessTypeGuest)
+
+	case strings.HasPrefix(data, "appr_user_"):
+		requestID := strings.TrimPrefix(data, "appr_user_")
+		b.handleApproveUserRequest(chatID, userID, messageID, requestID)
+
+	case strings.HasPrefix(data, "rej_req_"):
+		requestID := strings.TrimPrefix(data, "rej_req_")
+		b.handleRejectRequest(chatID, userID, messageID, requestID)
+
+	case strings.HasPrefix(data, "gen_web_link_"):
+		barrierID := strings.TrimPrefix(data, "gen_web_link_")
+		b.handleGenerateAnonymousLink(chatID, userID, messageID, barrierID)
+
 	case strings.HasPrefix(data, "ctrl_"):
 		phone := strings.TrimPrefix(data, "ctrl_")
 		b.showBarrierControl(chatID, userID, messageID, phone)
@@ -53,6 +81,16 @@ func (b *Bot) handleCallback(query *tgbotapi.CallbackQuery) {
 
 	case data == "manage_barriers":
 		b.showManageBarriers(chatID, userID, messageID)
+
+	case data == "show_web_link":
+		b.showWebLink(chatID, userID, messageID)
+
+	case data == "gen_anon_link":
+		b.showBarrierSelection(chatID, userID, messageID, "anon")
+
+	case strings.HasPrefix(data, "sel_anon_"):
+		barrierID := strings.TrimPrefix(data, "sel_anon_")
+		b.handleGenerateAnonymousLink(chatID, userID, messageID, barrierID)
 
 	// --- УПРАВЛЕНИЕ ШЛАГБАУМОМ ---
 	case strings.HasPrefix(data, "open_"):
@@ -156,73 +194,32 @@ func (b *Bot) handleOpenBarrier(chatID int64, messageID int, userID int64, usern
 		return
 	}
 
-	mRaw, _ := b.openingMu.LoadOrStore(phone, &sync.Mutex{})
-	mu := mRaw.(*sync.Mutex)
-	if !mu.TryLock() {
-		b.editMessage(chatID, messageID, "⏳ Шлагбаум уже открывается другим пользователем...")
-		return
-	}
-	defer mu.Unlock()
-
-	if lastOpen, ok := b.cooldowns.Load(phone); ok {
-		if time.Since(lastOpen.(time.Time)) < 5*time.Second {
-			remaining := 5 - int(time.Since(lastOpen.(time.Time)).Seconds())
-			b.editMessage(chatID, messageID, fmt.Sprintf("⏳ Подождите %d сек...", remaining))
+	err := b.OpenBarrierInternal(phone, userID, username)
+	if err != nil {
+		// If error is from TryLock or cooldown, we might want to show it.
+		// OpenBarrierInternal currently returns errors for those.
+		if err.Error() == "шлагбаум уже открывается" {
+			b.editMessage(chatID, messageID, "⏳ Шлагбаум уже открывается другим пользователем...")
+			return
+		}
+		if err.Error() == "подождите немного" {
+			// Calculate remaining time? For now keep it simple.
+			b.editMessage(chatID, messageID, "⏳ Подождите немного...")
 			return
 		}
 	}
-	b.cooldowns.Store(phone, time.Now())
 
-	b.barrierStatuses.Store(phone, config.StatusOpening)
+	// Update Telegram UI based on current status (which was updated by OpenBarrierInternal)
 	b.showBarrierControl(chatID, userID, messageID, phone)
 
-	// Structured logging for journald visibility
-	log.Printf("BARRIER_OPEN_REQUEST user_id=%d username=%s barrier=%s", userID, username, phone)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-
-	err := b.sipClient.OpenBarrier(ctx, phone)
-
-	if err != nil {
-		log.Printf("BARRIER_OPEN_ERROR user_id=%d username=%s barrier=%s error=%q", userID, username, phone, err.Error())
-		b.barrierStatuses.Store(phone, config.StatusError)
-		b.barrierLogs.Store(phone, fmt.Sprintf("❌ Ошибка: %v", err))
-
-		b.store.AddLog(phone, config.LogEntry{
-			UserID:    userID,
-			Username:  username,
-			Timestamp: time.Now(),
-			Status:    fmt.Sprintf("Error: %v", err),
-		})
-	} else {
-		log.Printf("BARRIER_OPEN_SUCCESS user_id=%d username=%s barrier=%s", userID, username, phone)
-		b.barrierStatuses.Store(phone, config.StatusOpened)
-		b.barrierLogs.Store(phone, fmt.Sprintf("✅ Последний раз открыто %s в %s", username, time.Now().Format("02.01 15:04")))
-
-		b.store.AddLog(phone, config.LogEntry{
-			UserID:    userID,
-			Username:  username,
-			Timestamp: time.Now(),
-			Status:    "Opened",
-		})
-	}
-
-	b.showBarrierControl(chatID, userID, messageID, phone)
-
-	go func() {
-		time.Sleep(5 * time.Second)
-		b.barrierStatuses.Store(phone, config.StatusOnline)
-		b.showBarrierControl(chatID, userID, messageID, phone)
-	}()
+	// Since OpenBarrierInternal is synchronous for the SIP call, we can update UI after it returns.
+	// But it also has a goroutine to return to Online status.
+	// We might need to listen to status changes to update TG UI in real-time if we want it perfect,
+	// but for now, updating after the call and then once more (maybe via a callback) is fine.
 }
 
 func (b *Bot) showBarrierList(chatID int64, userID int64, messageID int) {
 	barriers := b.store.GetUserBarriers(userID)
-	if len(barriers) == 0 {
-		b.showError(chatID, messageID, "У вас нет доступа ни к одному шлагбауму.")
-		return
-	}
 
 	var rows [][]tgbotapi.InlineKeyboardButton
 	for _, br := range barriers {
@@ -241,6 +238,10 @@ func (b *Bot) showBarrierList(chatID int64, userID int64, messageID int) {
 	}
 
 	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("❓ Запросить доступ", "request_access_list"),
+	))
+
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
 		tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "main_menu"),
 	))
 
@@ -248,6 +249,156 @@ func (b *Bot) showBarrierList(chatID int64, userID int64, messageID int) {
 	kb := tgbotapi.NewInlineKeyboardMarkup(rows...)
 	msg.ReplyMarkup = &kb
 	b.api.Send(msg)
+}
+
+func (b *Bot) showRequestBarrierList(chatID int64, userID int64, messageID int) {
+	barriers := b.store.GetBarriers()
+	var rows [][]tgbotapi.InlineKeyboardButton
+
+	// Show barriers user DOES NOT have access to
+	hasAccess := make(map[string]bool)
+	for _, b := range b.store.GetUserBarriers(userID) {
+		hasAccess[b.Phone] = true
+	}
+
+	for _, br := range barriers {
+		if !hasAccess[br.Phone] {
+			btn := tgbotapi.NewInlineKeyboardButtonData(br.Name, "req_bar_"+br.Phone)
+			rows = append(rows, tgbotapi.NewInlineKeyboardRow(btn))
+		}
+	}
+
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "barrier_list"),
+	))
+
+	edit := tgbotapi.NewEditMessageText(chatID, messageID, "❓ Выберите шлагбаум для запроса доступа:")
+	kb := tgbotapi.NewInlineKeyboardMarkup(rows...)
+	edit.ReplyMarkup = &kb
+	b.api.Send(edit)
+}
+
+func (b *Bot) showRequestAdminList(chatID int64, userID int64, messageID int, barrierID string) {
+	admins := b.store.GetBarrierAdmins(barrierID)
+	var rows [][]tgbotapi.InlineKeyboardButton
+
+	for _, a := range admins {
+		u, ok := b.store.GetUser(a.UserID)
+		name := fmt.Sprintf("ID: %d", a.UserID)
+		if ok {
+			name = u.FullName
+		}
+		btn := tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("👮 %s", name), fmt.Sprintf("req_send_%s_%d", barrierID, a.UserID))
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(btn))
+	}
+
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "request_access_list"),
+	))
+
+	edit := tgbotapi.NewEditMessageText(chatID, messageID, "Выберите администратора для отправки запроса:")
+	kb := tgbotapi.NewInlineKeyboardMarkup(rows...)
+	edit.ReplyMarkup = &kb
+	b.api.Send(edit)
+}
+
+func (b *Bot) handleSendAccessRequest(chatID int64, userID int64, messageID int, barrierID string, adminID int64) {
+	user, _ := b.store.GetUser(userID)
+	request := config.AccessRequest{
+		UserID:    userID,
+		BarrierID: barrierID,
+		AdminID:   adminID,
+		Status:    "PENDING",
+	}
+
+	err := b.store.AddAccessRequest(&request)
+	if err != nil {
+		b.showError(chatID, messageID, "❌ Ошибка отправки запроса.")
+		return
+	}
+
+	// Notify Admin
+	barrierName := barrierID
+	for _, br := range b.store.GetBarriers() {
+		if br.Phone == barrierID {
+			barrierName = br.Name
+			break
+		}
+	}
+
+	adminMsg := tgbotapi.NewMessage(adminID, fmt.Sprintf("🔔 Новый запрос доступа!\nПользователь: %s (@%s)\nШлагбаум: %s", user.FullName, user.Username, barrierName))
+	adminMsg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("✅ Гость (24ч)", "appr_guest_"+request.ID),
+			tgbotapi.NewInlineKeyboardButtonData("✅ Пользователь", "appr_user_"+request.ID),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("❌ Отклонить", "rej_req_"+request.ID),
+		),
+	)
+	b.api.Send(adminMsg)
+
+	b.editMessageWithBack(chatID, messageID, "✅ Запрос успешно отправлен администратору.", "barrier_list")
+}
+
+func (b *Bot) handleApproveUserRequest(chatID int64, userID int64, messageID int, requestID string) {
+	req, ok := b.store.GetAccessRequest(requestID)
+	if !ok {
+		b.showError(chatID, messageID, "Запрос не найден.")
+		return
+	}
+
+	// Fetch user info to keep session complete
+	user, _ := b.store.GetUser(req.UserID)
+
+	// Set session to handle duration selection
+	b.sessions.Store(userID, Session{
+		State:      StateWaitingExpiration,
+		BarrierID:  req.BarrierID,
+		TargetID:   req.UserID,
+		TargetUser: user.Username,
+		TargetName: user.FullName,
+		RequestID:  requestID,
+		LastMenuID: messageID,
+	})
+
+	b.showExpirationMenuSPA(chatID, messageID, req.BarrierID)
+}
+
+func (b *Bot) handleApproveRequest(chatID int64, userID int64, messageID int, requestID string, accType config.AccessType) {
+	req, ok := b.store.GetAccessRequest(requestID)
+	if !ok {
+		b.showError(chatID, messageID, "Запрос не найден.")
+		return
+	}
+
+	if !b.store.IsBarrierAdmin(userID, req.BarrierID) {
+		b.showError(chatID, messageID, "❌ Нет прав.")
+		return
+	}
+
+	expiresAt := time.Now().Add(24 * time.Hour)
+	err := b.store.GrantAccess(userID, req.UserID, req.BarrierID, expiresAt, accType)
+	if err != nil {
+		b.showError(chatID, messageID, "❌ Ошибка при одобрении.")
+		return
+	}
+
+	b.store.UpdateAccessRequestStatus(requestID, "APPROVED")
+	b.editMessage(chatID, messageID, "✅ Запрос одобрен (Гость 24ч).")
+
+	// Notify User
+	b.api.Send(tgbotapi.NewMessage(req.UserID, "✅ Ваш запрос доступа одобрен (на 24 часа)!"))
+}
+
+func (b *Bot) handleRejectRequest(chatID int64, userID int64, messageID int, requestID string) {
+	req, ok := b.store.GetAccessRequest(requestID)
+	if !ok {
+		return
+	}
+	b.store.UpdateAccessRequestStatus(requestID, "REJECTED")
+	b.editMessage(chatID, messageID, "❌ Запрос отклонен.")
+	b.api.Send(tgbotapi.NewMessage(req.UserID, "❌ Ваш запрос доступа был отклонен администратором."))
 }
 
 func (b *Bot) showBarrierControl(chatID int64, userID int64, messageID int, phone string) {
@@ -289,6 +440,15 @@ func (b *Bot) showBarrierControl(chatID int64, userID int64, messageID int, phon
 		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("🔓 Открыть", "open_"+phone),
 		))
+
+		// Any user with USER or OWNER access type can generate 24h web link
+		// We already checked CanOpen before showing this screen.
+		// Guests are excluded from link generation logic in store or here.
+		if b.canGenerateLink(userID, phone) {
+			rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("🔗 Создать гостевую ссылку", "gen_web_link_"+phone),
+			))
+		}
 	}
 
 	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
@@ -323,6 +483,9 @@ func (b *Bot) sendAdminMenu(chatID int64, userID int64, messageID int) {
 		),
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("👮 Админы", "manage_admins"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔗 Гостевая ссылка (24ч)", "gen_anon_link"),
 		),
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("📜 Лог действий", "view_audit_log"),
@@ -536,6 +699,38 @@ func (b *Bot) startGuestAccess(chatID int64, userID int64, messageID int) {
 
 func (b *Bot) handleStateInput(msg *tgbotapi.Message, sess Session) {
 	userID := msg.From.ID
+
+	// Handle Contact
+	if msg.Contact != nil {
+		contact := msg.Contact
+		firstName := contact.FirstName
+		lastName := contact.LastName
+		fullName := strings.TrimSpace(firstName + " " + lastName)
+
+		// Update target info in session
+		sess.TargetID = contact.UserID
+		sess.TargetUser = "" // Contact doesn't have username
+		sess.TargetName = fullName
+
+		// If we are waiting for ID, we can proceed to next step
+		if sess.State == StateWaitingUserID || sess.State == StateWaitingAdminID || sess.State == StateWaitingGuestID {
+			if sess.State == StateWaitingGuestID {
+				sess.State = StateWaitingGuestName // Or skip to confirm if we already have name
+				// Let's keep it simple and skip to confirmation since we have name from contact
+				b.confirmAddGuest(msg.Chat.ID, userID, sess)
+				b.sessions.Delete(userID)
+				return
+			} else if sess.State == StateWaitingUserID {
+				sess.State = StateWaitingExpiration
+				b.showExpirationMenuSPA(msg.Chat.ID, sess.LastMenuID, sess.BarrierID)
+			} else {
+				b.confirmAddAdminSPA(msg.Chat.ID, userID, sess)
+			}
+			b.sessions.Store(userID, sess)
+			return
+		}
+	}
+
 	text := msg.Text
 
 	deleteMsg := tgbotapi.NewDeleteMessage(msg.Chat.ID, msg.MessageID)
@@ -731,6 +926,12 @@ func (b *Bot) handleExpirationSelection(chatID int64, userID int64, messageID in
 		}
 		text := fmt.Sprintf("✅ Пользователь добавлен!\nИмя: %s\nTelegram: @%s\nСрок: %s\nШлагбаум: %s", sess.TargetName, sess.TargetUser, expireText, sess.BarrierID)
 		b.editMessage(chatID, messageID, text)
+
+		if sess.RequestID != "" {
+			b.store.UpdateAccessRequestStatus(sess.RequestID, "APPROVED")
+			b.api.Send(tgbotapi.NewMessage(sess.TargetID, "✅ Ваш запрос доступа одобрен! Теперь вы можете открывать шлагбаум."))
+		}
+
 		b.store.AddAdminLog(config.AdminLog{
 			Timestamp: time.Now(),
 			AdminID:   userID,
@@ -915,6 +1116,88 @@ func (b *Bot) showAuditLogs(chatID int64, messageID int) {
 
 func (b *Bot) showError(chatID int64, messageID int, text string) {
 	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "main_menu"),
+		),
+	)
+	edit.ReplyMarkup = &kb
+	b.api.Send(edit)
+}
+
+func (b *Bot) canGenerateLink(userID int64, barrierID string) bool {
+	if b.store.IsBarrierAdmin(userID, barrierID) {
+		return true
+	}
+
+	cfg := b.store.GetConfig()
+	for _, a := range cfg.Accesses {
+		if a.UserID == userID && a.BarrierID == barrierID {
+			// Only USER or OWNER can generate links
+			if a.Type == config.AccessTypeUser || a.Type == config.AccessTypeOwner {
+				if a.ExpiresAt.IsZero() || a.ExpiresAt.After(time.Now()) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func (b *Bot) handleGenerateAnonymousLink(chatID int64, userID int64, messageID int, barrierID string) {
+	if !b.canGenerateLink(userID, barrierID) {
+		b.showError(chatID, messageID, "❌ Ошибка доступа.")
+		return
+	}
+
+	token, err := b.store.AddAnonymousAccess(userID, barrierID)
+	if err != nil {
+		b.showError(chatID, messageID, "❌ Ошибка генерации ссылки.")
+		return
+	}
+
+	cfg := b.store.GetConfig()
+	prefix := cfg.Web.Prefix
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	link := fmt.Sprintf("%s%sindex.html?token=%s", cfg.Web.BaseURL, prefix, token)
+
+	text := fmt.Sprintf("🔗 Гостевая ссылка создана!\n\nОна будет действовать 24 часа и позволяет открыть только выбранный шлагбаум.\n\n[Открыть в браузере](%s)", link)
+
+	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
+	edit.ParseMode = "Markdown"
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "ctrl_"+barrierID),
+		),
+	)
+	edit.ReplyMarkup = &kb
+	b.api.Send(edit)
+}
+
+func (b *Bot) showWebLink(chatID int64, userID int64, messageID int) {
+	user, ok := b.store.GetUser(userID)
+	if !ok || user.WebToken == "" {
+		b.showError(chatID, messageID, "❌ Ошибка: пользователь не найден или токен не сгенерирован.")
+		return
+	}
+
+	cfg := b.store.GetConfig()
+	if !cfg.Web.Enabled {
+		b.showError(chatID, messageID, "❌ Веб-интерфейс отключен в настройках.")
+		return
+	}
+
+	prefix := cfg.Web.Prefix
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	link := fmt.Sprintf("%s%sindex.html?token=%s", cfg.Web.BaseURL, prefix, user.WebToken)
+	text := fmt.Sprintf("🌐 Ваш личный веб-интерфейс:\n\nЭтот интерфейс позволяет открывать доступные вам шлагбаумы через браузер.\n\n[Открыть в браузере](%s)\n\n⚠️ Не передавайте эту ссылку посторонним!", link)
+
+	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
+	edit.ParseMode = "Markdown"
 	kb := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "main_menu"),

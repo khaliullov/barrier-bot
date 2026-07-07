@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/khaliullov/barrier-bot/internal/config"
 	"github.com/khaliullov/barrier-bot/internal/sip"
 	"github.com/khaliullov/barrier-bot/internal/storage"
+	"github.com/khaliullov/barrier-bot/internal/web"
 )
 
 type UserState string
@@ -29,6 +31,7 @@ const (
 	StateWaitingBarrierPhone UserState = "WAITING_BARRIER_PHONE"
 	StateWaitingGuestID      UserState = "WAITING_GUEST_ID"
 	StateWaitingGuestName    UserState = "WAITING_GUEST_NAME"
+	StateWaitingRequestAdmin UserState = "WAITING_REQUEST_ADMIN"
 )
 
 type Session struct {
@@ -37,6 +40,7 @@ type Session struct {
 	TargetID   int64
 	TargetUser string
 	TargetName string
+	RequestID  string
 	Role       config.Role
 	LastMenuID int // ID сообщения, которое редактируется
 }
@@ -45,6 +49,7 @@ type Bot struct {
 	api       *tgbotapi.BotAPI
 	store     *storage.Store
 	sipClient *sip.Client
+	webServer *web.Server
 
 	cooldowns       sync.Map // barrierPhone -> time.Time
 	sessions        sync.Map // userID -> Session
@@ -53,7 +58,7 @@ type Bot struct {
 	openingMu       sync.Map // barrierPhone -> *sync.Mutex (для предотвращения одновременных открытий)
 }
 
-func NewBot(token string, store *storage.Store, sipClient *sip.Client, forceIPv6 bool) (*Bot, error) {
+func NewBot(token string, store *storage.Store, sipClient *sip.Client, forceIPv6 bool, webServer *web.Server) (*Bot, error) {
 	dialer := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
@@ -85,6 +90,7 @@ func NewBot(token string, store *storage.Store, sipClient *sip.Client, forceIPv6
 		api:       api,
 		store:     store,
 		sipClient: sipClient,
+		webServer: webServer,
 	}
 
 	// Инициализация статусов
@@ -104,7 +110,85 @@ func NewBot(token string, store *storage.Store, sipClient *sip.Client, forceIPv6
 		}
 	}
 
+	if webServer != nil {
+		webServer.Statuses = &b.barrierStatuses
+		webServer.OpenFunc = func(barrierID string, userID int64, source string) error {
+			return b.OpenBarrierInternal(barrierID, userID, source)
+		}
+	}
+
 	return b, nil
+}
+
+func (b *Bot) OpenBarrierInternal(phone string, userID int64, source string) error {
+	// Race condition prevention
+	mRaw, _ := b.openingMu.LoadOrStore(phone, &sync.Mutex{})
+	mu := mRaw.(*sync.Mutex)
+	if !mu.TryLock() {
+		return fmt.Errorf("шлагбаум уже открывается")
+	}
+	defer mu.Unlock()
+
+	if lastOpen, ok := b.cooldowns.Load(phone); ok {
+		if time.Since(lastOpen.(time.Time)) < 5*time.Second {
+			return fmt.Errorf("подождите немного")
+		}
+	}
+	b.cooldowns.Store(phone, time.Now())
+
+	b.barrierStatuses.Store(phone, config.StatusOpening)
+	if b.webServer != nil {
+		b.webServer.NotifyStatusChange(phone, config.StatusOpening)
+	}
+
+	// Structured logging for journald visibility
+	log.Printf("BARRIER_OPEN_REQUEST user_id=%d source=%s barrier=%s", userID, source, phone)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	err := b.sipClient.OpenBarrier(ctx, phone)
+
+	if err != nil {
+		log.Printf("BARRIER_OPEN_ERROR user_id=%d source=%s barrier=%s error=%q", userID, source, phone, err.Error())
+		b.barrierStatuses.Store(phone, config.StatusError)
+		b.barrierLogs.Store(phone, fmt.Sprintf("❌ Ошибка: %v", err))
+		if b.webServer != nil {
+			b.webServer.NotifyStatusChange(phone, config.StatusError)
+		}
+
+		b.store.AddLog(phone, config.LogEntry{
+			UserID:    userID,
+			Username:  source,
+			Timestamp: time.Now(),
+			Status:    fmt.Sprintf("Error: %v", err),
+		})
+	} else {
+		log.Printf("BARRIER_OPEN_SUCCESS user_id=%d source=%s barrier=%s", userID, source, phone)
+		b.barrierStatuses.Store(phone, config.StatusOpened)
+		b.barrierLogs.Store(phone, fmt.Sprintf("✅ Последний раз открыто через %s в %s", source, time.Now().Format("02.01 15:04")))
+		if b.webServer != nil {
+			b.webServer.NotifyStatusChange(phone, config.StatusOpened)
+		}
+
+		b.store.AddLog(phone, config.LogEntry{
+			UserID:    userID,
+			Username:  source,
+			Timestamp: time.Now(),
+			Status:    "Opened",
+		})
+	}
+
+	// Return to online after 5 seconds
+	go func() {
+		time.Sleep(5 * time.Second)
+		b.barrierStatuses.Store(phone, config.StatusOnline)
+		if b.webServer != nil {
+			b.webServer.NotifyStatusChange(phone, config.StatusOnline)
+		}
+	}()
+
+	return err
 }
 
 func (b *Bot) Run() {
@@ -219,7 +303,14 @@ func (b *Bot) getMainMenuKeyboard(userID int64) tgbotapi.InlineKeyboardMarkup {
 		))
 	}
 
-	// 3. Админ-панель
+	// 3. Личный веб-интерфейс (только для гостей)
+	if b.store.IsGuestOnly(userID) {
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🌐 Веб-интерфейс", "show_web_link"),
+		))
+	}
+
+	// 4. Админ-панель
 	isAdmin := b.store.IsSuperAdmin(userID)
 	if !isAdmin {
 		for _, br := range b.store.GetBarriers() {

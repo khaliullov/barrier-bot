@@ -10,6 +10,16 @@ debug = true
 # Принудительно использовать IPv6 для соединения с Telegram API
 force_ipv6 = true
 
+[web]
+# Включить веб-интерфейс для гостей
+enabled = true
+port = 8080
+prefix = "/guest"
+# Публичный адрес бота для формирования ссылок
+base_url = "https://your-domain.com"
+# Секретный токен для системного доступа (опционально)
+secret_token = "change-me-to-something-secure"
+
 [sip]
 # Настройки SIP провайдера (пример для Мегафон Мультифон)
 host = "multifon.ru"

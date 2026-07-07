@@ -13,6 +13,7 @@ import (
 	"github.com/khaliullov/barrier-bot/internal/config"
 	"github.com/khaliullov/barrier-bot/internal/sip"
 	"github.com/khaliullov/barrier-bot/internal/storage"
+	"github.com/khaliullov/barrier-bot/internal/web"
 )
 
 func main() {
@@ -56,13 +57,24 @@ func main() {
 	// 3. Initialize Storage/Store
 	store := storage.NewStore(cfgManager)
 
-	// 4. Initialize Bot
-	telegramBot, err := bot.NewBot(cfg.TelegramToken, store, sipClient, cfg.ForceIPv6)
+	// 4. Initialize Web Server (if enabled)
+	var webServer *web.Server
+	if cfg.Web.Enabled {
+		webServer = web.NewServer(cfg.Web, store, nil) // status sync.Map will be passed by Bot
+		go func() {
+			if err := webServer.Start(); err != nil {
+				log.Printf("Web server error: %v", err)
+			}
+		}()
+	}
+
+	// 5. Initialize Bot
+	telegramBot, err := bot.NewBot(cfg.TelegramToken, store, sipClient, cfg.ForceIPv6, webServer)
 	if err != nil {
 		log.Fatalf("Failed to initialize Telegram bot: %v", err)
 	}
 
-	// 5. Run
+	// 6. Run
 	log.Println("Barrier Bot is starting...")
 	go telegramBot.Run()
 

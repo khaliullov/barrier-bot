@@ -114,6 +114,25 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now barrier-bot
 ```
 
+### 5. Настройка Nginx (Проксирование)
+
+Для доступа к веб-интерфейсу снаружи настройте Nginx как реверс-прокси. Добавьте следующий блок в конфигурацию вашего сайта:
+
+```nginx
+location /guest/ {
+    proxy_pass http://127.0.0.1:8080/guest/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # WebSocket support
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "Upgrade";
+}
+```
+
 ## Управление
 
 *   **/start** — Основное меню управления шлагбаумами.

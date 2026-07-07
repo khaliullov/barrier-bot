@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"time"
 
@@ -102,6 +104,73 @@ func (s *Store) GetUser(userID int64) (config.User, bool) {
 	return config.User{}, false
 }
 
+func (s *Store) GetUserByToken(token string) (config.User, bool) {
+	if token == "" {
+		return config.User{}, false
+	}
+	cfg := s.manager.Config()
+	for _, u := range cfg.Users {
+		if u.WebToken == token {
+			return u, true
+		}
+	}
+	return config.User{}, false
+}
+
+func (s *Store) GetAnonymousAccess(token string) (config.AnonymousAccess, bool) {
+	if token == "" {
+		return config.AnonymousAccess{}, false
+	}
+	cfg := s.manager.Config()
+	for _, a := range cfg.AnonymousAccesses {
+		if a.Token == token {
+			if a.ExpiresAt.After(time.Now()) {
+				return a, true
+			}
+		}
+	}
+	return config.AnonymousAccess{}, false
+}
+
+func (s *Store) AddAnonymousAccess(adminID int64, barrierID string) (string, error) {
+	token := generateToken()
+	err := s.manager.Update(func(cfg *config.Config) {
+		cfg.AnonymousAccesses = append(cfg.AnonymousAccesses, config.AnonymousAccess{
+			Token:     token,
+			BarrierID: barrierID,
+			ExpiresAt: time.Now().Add(24 * time.Hour),
+			CreatedBy: adminID,
+		})
+	})
+	return token, err
+}
+
+func (s *Store) IsGuestOnly(userID int64) bool {
+	if s.IsSuperAdmin(userID) {
+		return false
+	}
+	cfg := s.manager.Config()
+	// Check if admin
+	for _, adm := range cfg.Admins {
+		if adm.UserID == userID {
+			return false
+		}
+	}
+	// Check accesses
+	isGuest := false
+	for _, a := range cfg.Accesses {
+		if a.UserID == userID {
+			if a.Type != config.AccessTypeGuest {
+				return false // Has regular access
+			}
+			if a.ExpiresAt.IsZero() || a.ExpiresAt.After(time.Now()) {
+				isGuest = true
+			}
+		}
+	}
+	return isGuest
+}
+
 func (s *Store) GetUserByUsername(username string) (config.User, bool) {
 	if username == "" {
 		return config.User{}, false
@@ -173,14 +242,28 @@ func (s *Store) UpsertUser(user config.User) error {
 			if user.FullName != "" {
 				existingUser.FullName = user.FullName
 			}
+			if existingUser.WebToken == "" {
+				existingUser.WebToken = generateToken()
+			}
 		} else {
 			// Новый пользователь
 			if user.CreatedAt.IsZero() {
 				user.CreatedAt = time.Now()
 			}
+			if user.WebToken == "" {
+				user.WebToken = generateToken()
+			}
 			cfg.Users = append(cfg.Users, user)
 		}
 	})
+}
+
+func generateToken() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b)
 }
 
 // Access Management
@@ -316,14 +399,72 @@ func (s *Store) RemoveAdmin(userID int64, barrierID string) error {
 }
 
 func (s *Store) GetBarrierAdmins(barrierID string) []config.Admin {
-	var admins []config.Admin
 	cfg := s.manager.Config()
+	var admins []config.Admin
+	seen := make(map[int64]bool)
+
+	// 1. Всегда добавляем Master Admin
+	admins = append(admins, config.Admin{
+		UserID:    cfg.MasterAdminID,
+		Role:      config.RoleSuperAdmin,
+		BarrierID: "", // Глобальный админ
+	})
+	seen[cfg.MasterAdminID] = true
+
+	// 2. Добавляем всех Super Admins
 	for _, a := range cfg.Admins {
-		if a.BarrierID == barrierID {
-			admins = append(admins, a)
+		if a.Role == config.RoleSuperAdmin {
+			if !seen[a.UserID] {
+				admins = append(admins, a)
+				seen[a.UserID] = true
+			}
 		}
 	}
+
+	// 3. Добавляем администраторов конкретного шлагбаума
+	for _, a := range cfg.Admins {
+		if a.BarrierID == barrierID && a.Role == config.RoleBarrierAdmin {
+			if !seen[a.UserID] {
+				admins = append(admins, a)
+				seen[a.UserID] = true
+			}
+		}
+	}
+
 	return admins
+}
+
+func (s *Store) AddAccessRequest(req *config.AccessRequest) error {
+	return s.manager.Update(func(cfg *config.Config) {
+		if req.CreatedAt.IsZero() {
+			req.CreatedAt = time.Now()
+		}
+		if req.ID == "" {
+			req.ID = fmt.Sprintf("req_%d_%s_%d", req.UserID, req.BarrierID, time.Now().UnixNano())
+		}
+		cfg.AccessRequests = append(cfg.AccessRequests, *req)
+	})
+}
+
+func (s *Store) GetAccessRequest(id string) (config.AccessRequest, bool) {
+	cfg := s.manager.Config()
+	for _, r := range cfg.AccessRequests {
+		if r.ID == id {
+			return r, true
+		}
+	}
+	return config.AccessRequest{}, false
+}
+
+func (s *Store) UpdateAccessRequestStatus(id string, status string) error {
+	return s.manager.Update(func(cfg *config.Config) {
+		for i, r := range cfg.AccessRequests {
+			if r.ID == id {
+				cfg.AccessRequests[i].Status = status
+				break
+			}
+		}
+	})
 }
 
 // Barrier Management
@@ -366,4 +507,18 @@ func (s *Store) GetLogs(phone string) []config.LogEntry {
 
 func (s *Store) GetAdminLogs() []config.AdminLog {
 	return s.manager.Config().AdminLogs
+}
+
+func (s *Store) GetConfig() config.Config {
+	return s.manager.Config()
+}
+
+func (s *Store) GetLastOpenTime(barrierID string) time.Time {
+	logs := s.GetLogs(barrierID)
+	for i := len(logs) - 1; i >= 0; i-- {
+		if logs[i].Status == "Opened" {
+			return logs[i].Timestamp
+		}
+	}
+	return time.Time{}
 }

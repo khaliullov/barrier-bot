@@ -44,6 +44,14 @@ type SIPConfig struct {
 	Password      string `toml:"password"`
 }
 
+type WebConfig struct {
+	Enabled     bool   `toml:"enabled"`
+	Port        int    `toml:"port"`
+	Prefix      string `toml:"prefix"`
+	SecretToken string `toml:"secret_token"`
+	BaseURL     string `toml:"base_url"` // e.g., https://mybot.com
+}
+
 type Barrier struct {
 	Phone string `toml:"phone"`
 	Name  string `toml:"name"`
@@ -54,6 +62,7 @@ type User struct {
 	Username   string    `toml:"username"`
 	FullName   string    `toml:"full_name"`
 	CreatedAt  time.Time `toml:"created_at"`
+	WebToken   string    `toml:"web_token"`
 }
 
 type Access struct {
@@ -91,6 +100,22 @@ type AdminLog struct {
 	Details   string    `toml:"details"`
 }
 
+type AnonymousAccess struct {
+	Token     string    `toml:"token"`
+	BarrierID string    `toml:"barrier_id"`
+	ExpiresAt time.Time `toml:"expires_at"`
+	CreatedBy int64     `toml:"created_by"`
+}
+
+type AccessRequest struct {
+	ID        string    `toml:"id"`
+	UserID    int64     `toml:"user_id"`
+	BarrierID string    `toml:"barrier_id"`
+	AdminID   int64     `toml:"admin_id"`
+	Status    string    `toml:"status"` // PENDING, APPROVED, REJECTED
+	CreatedAt time.Time `toml:"created_at"`
+}
+
 type Config struct {
 	TelegramToken string `toml:"telegram_token"`
 	MasterAdminID int64  `toml:"master_admin_id"`
@@ -98,11 +123,14 @@ type Config struct {
 	ForceIPv6     bool   `toml:"force_ipv6"`
 
 	SIP SIPConfig `toml:"sip"`
+	Web WebConfig `toml:"web"`
 
-	Barriers []Barrier `toml:"barriers"`
-	Users    []User    `toml:"users"`
-	Accesses []Access  `toml:"accesses"`
-	Admins   []Admin   `toml:"administrators"`
+	Barriers          []Barrier         `toml:"barriers"`
+	Users             []User            `toml:"users"`
+	Accesses          []Access          `toml:"accesses"`
+	Admins            []Admin           `toml:"administrators"`
+	AnonymousAccesses []AnonymousAccess `toml:"anonymous_accesses"`
+	AccessRequests    []AccessRequest   `toml:"access_requests"`
 
 	// AuditLogs maps Barrier Phone -> List of LogEntry (max 10)
 	AuditLogs map[string][]LogEntry `toml:"audit_logs"`
@@ -239,6 +267,16 @@ func (m *Manager) cleanupLocked() {
 		activeAccesses = append(activeAccesses, a)
 	}
 	m.cfg.Accesses = activeAccesses
+
+	// 1.1 Remove expired anonymous accesses
+	var activeAnon []AnonymousAccess
+	for _, a := range m.cfg.AnonymousAccesses {
+		if a.ExpiresAt.Before(now) {
+			continue
+		}
+		activeAnon = append(activeAnon, a)
+	}
+	m.cfg.AnonymousAccesses = activeAnon
 
 	// 2. Remove orphaned users
 	referencedUsers := make(map[int64]bool)
