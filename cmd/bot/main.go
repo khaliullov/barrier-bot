@@ -46,13 +46,13 @@ func main() {
 	sipClient.Start()
 
 	// Perform initial registration to detect NAT and verify credentials
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	if err := sipClient.Register(ctx); err != nil {
+	ctxReg, cancelReg := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := sipClient.Register(ctxReg); err != nil {
 		log.Printf("Initial SIP registration failed (NAT detection might be limited): %v", err)
 	} else {
 		log.Println("SIP registration successful")
 	}
-	cancel()
+	cancelReg()
 
 	// 3. Initialize Storage/Store
 	store := storage.NewStore(cfgManager)
@@ -74,9 +74,12 @@ func main() {
 		log.Fatalf("Failed to initialize Telegram bot: %v", err)
 	}
 
-	// 6. Run
+	// 6. Run with Graceful Shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	log.Println("Barrier Bot is starting...")
-	go telegramBot.Run()
+	go telegramBot.Run(ctx)
 
 	// Wait for termination
 	stop := make(chan os.Signal, 1)
@@ -84,4 +87,9 @@ func main() {
 	<-stop
 
 	log.Println("Shutting down...")
+	cancel() // Signal context cancellation
+
+	// Give some time for components to stop cleanly
+	time.Sleep(time.Second)
+	log.Println("Process finished.")
 }

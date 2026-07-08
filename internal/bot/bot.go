@@ -60,7 +60,7 @@ type Bot struct {
 
 func NewBot(token string, store *storage.Store, sipClient *sip.Client, forceIPv6 bool, webServer *web.Server) (*Bot, error) {
 	dialer := &net.Dialer{
-		Timeout:   30 * time.Second,
+		Timeout:   10 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
 
@@ -77,8 +77,10 @@ func NewBot(token string, store *storage.Store, sipClient *sip.Client, forceIPv6
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
+	// Robust HTTP Client Configuration
 	client := &http.Client{
 		Transport: transport,
+		Timeout:   time.Minute * 2, // Slightly more than the long-polling timeout
 	}
 
 	api, err := tgbotapi.NewBotAPIWithClient(token, tgbotapi.APIEndpoint, client)
@@ -191,21 +193,61 @@ func (b *Bot) OpenBarrierInternal(phone string, userID int64, source string) err
 	return err
 }
 
-func (b *Bot) Run() {
+func (b *Bot) Run(ctx context.Context) {
 	// Регистрация глобальных команд
 	b.registerGlobalCommands()
 
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 
-	updates := b.api.GetUpdatesChan(u)
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Stopping Telegram bot...")
+			return
+		default:
+			// Improved Update Fetching Loop
+			updates := b.api.GetUpdatesChan(u)
 
-	for update := range updates {
-		if update.Message != nil {
-			b.handleMessage(update.Message)
-		} else if update.CallbackQuery != nil {
-			b.handleCallback(update.CallbackQuery)
+			log.Println("Telegram update listener started")
+			if err := b.processUpdates(ctx, updates); err != nil {
+				log.Printf("Update processing stopped: %v. Re-initializing in 5 seconds...", err)
+				select {
+				case <-time.After(5 * time.Second):
+				case <-ctx.Done():
+					return
+				}
+			}
 		}
+	}
+}
+
+func (b *Bot) processUpdates(ctx context.Context, updates tgbotapi.UpdatesChannel) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case update, ok := <-updates:
+			if !ok {
+				return fmt.Errorf("updates channel closed")
+			}
+			b.safeHandleUpdate(update)
+		}
+	}
+}
+
+func (b *Bot) safeHandleUpdate(update tgbotapi.Update) {
+	// Panic Recovery in Main Loop
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Recovered from panic in Telegram update handler: %v", r)
+		}
+	}()
+
+	if update.Message != nil {
+		b.handleMessage(update.Message)
+	} else if update.CallbackQuery != nil {
+		b.handleCallback(update.CallbackQuery)
 	}
 }
 
@@ -214,7 +256,9 @@ func (b *Bot) registerGlobalCommands() {
 		{Command: "start", Description: "Главное меню"},
 		{Command: "help", Description: "Справка"},
 	}
-	b.api.Send(tgbotapi.NewSetMyCommands(commands...))
+	if _, err := b.api.Request(tgbotapi.NewSetMyCommands(commands...)); err != nil {
+		log.Printf("Failed to register global commands: %v", err)
+	}
 }
 
 func (b *Bot) handleMessage(msg *tgbotapi.Message) {
@@ -277,7 +321,9 @@ func (b *Bot) registerUserCommands(userID int64) {
 	}
 
 	scope := tgbotapi.NewBotCommandScopeChat(userID)
-	b.api.Send(tgbotapi.NewSetMyCommandsWithScope(scope, commands...))
+	if _, err := b.api.Request(tgbotapi.NewSetMyCommandsWithScope(scope, commands...)); err != nil {
+		log.Printf("Failed to register user commands for user %d: %v", userID, err)
+	}
 }
 
 func (b *Bot) getMainMenuKeyboard(userID int64) tgbotapi.InlineKeyboardMarkup {
@@ -349,15 +395,21 @@ func (b *Bot) sendMainMenu(chatID int64, userID int64, messageID int) {
 	if messageID > 0 {
 		edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
 		edit.ReplyMarkup = &kb
-		b.api.Send(edit)
+		if _, err := b.api.Request(edit); err != nil {
+			log.Printf("Failed to edit main menu for user %d: %v", userID, err)
+		}
 	} else {
 		msg := tgbotapi.NewMessage(chatID, text)
 		msg.ReplyMarkup = kb
-		b.api.Send(msg)
+		if _, err := b.api.Send(msg); err != nil {
+			log.Printf("Failed to send main menu to user %d: %v", userID, err)
+		}
 	}
 }
 
 func (b *Bot) reply(msg *tgbotapi.Message, text string) {
 	newMsg := tgbotapi.NewMessage(msg.Chat.ID, text)
-	b.api.Send(newMsg)
+	if _, err := b.api.Send(newMsg); err != nil {
+		log.Printf("Failed to send reply to user %d: %v", msg.From.ID, err)
+	}
 }
