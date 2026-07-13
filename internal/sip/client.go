@@ -124,6 +124,23 @@ func (c *Client) Register(ctx context.Context) error {
 }
 
 func (c *Client) OpenBarrier(ctx context.Context, phoneNumber string) error {
+	err := c.openBarrierInternal(ctx, phoneNumber)
+	if err != nil && strings.Contains(err.Error(), "500") {
+		// Megafon Multifon occasionally glitches with 500 error when session state is stale.
+		// Attempting a re-registration to refresh SBC session and then retrying once.
+		fmt.Printf("[SIP] Received 500 error, attempting re-registration to refresh session...\n")
+		regCtx, regCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_ = c.Register(regCtx)
+		regCancel()
+
+		// Small delay before retry
+		time.Sleep(1 * time.Second)
+		return c.openBarrierInternal(ctx, phoneNumber)
+	}
+	return err
+}
+
+func (c *Client) openBarrierInternal(ctx context.Context, phoneNumber string) error {
 	phoneNumber = strings.TrimPrefix(phoneNumber, "+")
 
 	userUri := &sip.SipUri{}
@@ -142,9 +159,19 @@ func (c *Client) OpenBarrier(ctx context.Context, phoneNumber string) error {
 	c.mu.RUnlock()
 
 	// Megafon Multifon requires a non-zero RTP port even if media is inactive.
-	// We'll use a dummy port in the provider's range (10000-27999)
-	// but we won't actually open it.
-	dummyRtpPort := 10000 + (time.Now().UnixNano() % 10000)
+	// We use a deterministic port based on the last digits of the barrier's phone.
+	// This makes traffic patterns predictable for the SBC (e.g., ...258 -> 40258).
+	portOffset := 0
+	cleanPhone := strings.Map(func(r rune) rune {
+		if r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, phoneNumber)
+	if len(cleanPhone) >= 3 {
+		fmt.Sscanf(cleanPhone[len(cleanPhone)-3:], "%d", &portOffset)
+	}
+	dummyRtpPort := 40000 + (portOffset % 1000)
 
 	sdp := fmt.Sprintf("v=0\r\n"+
 		"o=- %d %d IN IP4 %s\r\n"+
@@ -270,11 +297,28 @@ func (c *Client) doRequestWithAuth(ctx context.Context, req sip.Request) error {
 		return err
 	}
 
+	var response sip.Response
 	select {
 	case res := <-tx.Responses():
 		if c.debug {
 			fmt.Printf("[SIP] Incoming response to %s: %d %s\n%s\n", req.Method(), res.StatusCode(), res.Reason(), res.String())
 		}
+		if res.StatusCode() < 200 {
+			// Long-polling for final response if first was provisional
+			for {
+				select {
+				case r := <-tx.Responses():
+					if r.StatusCode() >= 200 {
+						res = r
+						goto auth_check
+					}
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+		}
+
+	auth_check:
 		if res.StatusCode() == 401 || res.StatusCode() == 407 {
 			authUri := req.Recipient().String()
 			authHeader := c.buildAuthHeader(res, string(req.Method()), authUri)
@@ -293,20 +337,36 @@ func (c *Client) doRequestWithAuth(ctx context.Context, req sip.Request) error {
 			if err != nil {
 				return err
 			}
-			res = <-tx2.Responses()
-			if c.debug {
-				fmt.Printf("[SIP] Incoming auth response to %s: %d %s\n%s\n", newReq.Method(), res.StatusCode(), res.Reason(), res.String())
+
+			// Wait for final response to the auth request
+			for {
+				select {
+				case res2 := <-tx2.Responses():
+					if c.debug {
+						fmt.Printf("[SIP] Incoming auth response to %s: %d %s\n%s\n", newReq.Method(), res2.StatusCode(), res2.Reason(), res2.String())
+					}
+					if res2.StatusCode() >= 200 {
+						response = res2
+						goto finalized
+					}
+				case <-ctx.Done():
+					return ctx.Err()
+				}
 			}
+		} else {
+			response = res
 		}
 
-		if res.StatusCode() == 200 {
-			c.updateNAT(res)
-			return nil
-		}
-		return fmt.Errorf("request failed: %d %s", res.StatusCode(), res.Reason())
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+
+finalized:
+	if response.StatusCode() == 200 {
+		c.updateNAT(response)
+		return nil
+	}
+	return fmt.Errorf("request failed: %d %s", response.StatusCode(), response.Reason())
 }
 
 func (c *Client) createBaseRequest(method sip.RequestMethod, fromUri, toUri, recipientUri sip.Uri) sip.Request {

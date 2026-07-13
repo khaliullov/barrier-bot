@@ -209,28 +209,30 @@ func (b *Bot) handleOpenBarrier(chatID int64, messageID int, userID int64, usern
 		return
 	}
 
+	// 1. Show immediate "Opening" status in Telegram
+	b.barrierStatuses.Store(phone, config.StatusOpening)
+	b.showBarrierControl(chatID, userID, messageID, phone)
+
 	err := b.OpenBarrierInternal(phone, userID, username)
 	if err != nil {
-		// If error is from TryLock or cooldown, we might want to show it.
-		// OpenBarrierInternal currently returns errors for those.
 		if err.Error() == "шлагбаум уже открывается" {
 			b.editMessage(chatID, messageID, "⏳ Шлагбаум уже открывается другим пользователем...")
 			return
 		}
 		if err.Error() == "подождите немного" {
-			// Calculate remaining time? For now keep it simple.
 			b.editMessage(chatID, messageID, "⏳ Подождите немного...")
 			return
 		}
 	}
 
-	// Update Telegram UI based on current status (which was updated by OpenBarrierInternal)
+	// 2. Update status to "Opened" or "Error" after call finishes
 	b.showBarrierControl(chatID, userID, messageID, phone)
 
-	// Since OpenBarrierInternal is synchronous for the SIP call, we can update UI after it returns.
-	// But it also has a goroutine to return to Online status.
-	// We might need to listen to status changes to update TG UI in real-time if we want it perfect,
-	// but for now, updating after the call and then once more (maybe via a callback) is fine.
+	// 3. Schedule return to "Ready" status in Telegram after 5 seconds
+	go func() {
+		time.Sleep(5 * time.Second)
+		b.showBarrierControl(chatID, userID, messageID, phone)
+	}()
 }
 
 func (b *Bot) showBarrierList(chatID int64, userID int64, messageID int) {
