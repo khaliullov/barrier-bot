@@ -299,7 +299,16 @@ func (m *Manager) cleanupLocked() {
 	m.cfg.Users = activeUsers
 
 	// 3. Enforce ring buffer size 10 for audit_logs
+	activeBarriers := make(map[string]bool)
+	for _, b := range m.cfg.Barriers {
+		activeBarriers[b.Phone] = true
+	}
+
 	for phone, logs := range m.cfg.AuditLogs {
+		if !activeBarriers[phone] {
+			delete(m.cfg.AuditLogs, phone)
+			continue
+		}
 		if len(logs) > 10 {
 			m.cfg.AuditLogs[phone] = logs[len(logs)-10:]
 		}
@@ -308,6 +317,11 @@ func (m *Manager) cleanupLocked() {
 	// 4. Enforce ring buffer size 10 for admin_logs
 	if len(m.cfg.AdminLogs) > 10 {
 		m.cfg.AdminLogs = m.cfg.AdminLogs[len(m.cfg.AdminLogs)-10:]
+	}
+
+	// 5. Enforce ring buffer size 20 for access_requests
+	if len(m.cfg.AccessRequests) > 20 {
+		m.cfg.AccessRequests = m.cfg.AccessRequests[len(m.cfg.AccessRequests)-20:]
 	}
 }
 
@@ -338,20 +352,12 @@ func (m *Manager) saveLocked() error {
 
 func (m *Manager) AddLog(phone string, entry LogEntry) error {
 	return m.Update(func(cfg *Config) {
-		logs := cfg.AuditLogs[phone]
-		logs = append(logs, entry)
-		if len(logs) > 10 {
-			logs = logs[len(logs)-10:]
-		}
-		cfg.AuditLogs[phone] = logs
+		cfg.AuditLogs[phone] = append(cfg.AuditLogs[phone], entry)
 	})
 }
 
 func (m *Manager) AddAdminLog(log AdminLog) error {
 	return m.Update(func(cfg *Config) {
 		cfg.AdminLogs = append(cfg.AdminLogs, log)
-		if len(cfg.AdminLogs) > 10 {
-			cfg.AdminLogs = cfg.AdminLogs[len(cfg.AdminLogs)-100:]
-		}
 	})
 }

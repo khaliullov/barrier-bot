@@ -119,6 +119,17 @@ func NewBot(token string, store *storage.Store, sipClient *sip.Client, forceIPv6
 		}
 	}
 
+	// Set SIP error handler to notify Super Admin
+	if sipClient != nil {
+		sipClient.OnError = func(err error) {
+			cfg := b.store.GetConfig()
+			if cfg.MasterAdminID != 0 {
+				msg := tgbotapi.NewMessage(cfg.MasterAdminID, fmt.Sprintf("⚠️ КРИТИЧЕСКАЯ ОШИБКА SIP:\n%v", err))
+				b.api.Send(msg)
+			}
+		}
+	}
+
 	return b, nil
 }
 
@@ -153,6 +164,16 @@ func (b *Bot) OpenBarrierInternal(phone string, userID int64, source string) err
 
 	if err != nil {
 		log.Printf("BARRIER_OPEN_ERROR user_id=%d source=%s barrier=%s error=%q", userID, source, phone, err.Error())
+
+		// Notify Master Admin about specific server errors (500)
+		if strings.Contains(err.Error(), "500") {
+			cfg := b.store.GetConfig()
+			if cfg.MasterAdminID != 0 {
+				adminMsg := tgbotapi.NewMessage(cfg.MasterAdminID, fmt.Sprintf("🚨 Сбой SIP (500 Error) при открытии шлагбаума %s пользователем %s", phone, source))
+				b.api.Send(adminMsg)
+			}
+		}
+
 		b.barrierStatuses.Store(phone, config.StatusError)
 		b.barrierLogs.Store(phone, fmt.Sprintf("❌ Ошибка: %v", err))
 		if b.webServer != nil {

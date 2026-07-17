@@ -31,6 +31,9 @@ type Client struct {
 	cancel context.CancelFunc
 	debug  bool
 
+	// Callback for critical system errors (SBC failures, registration loss)
+	OnError func(err error)
+
 	// Auth state for RFC 2617/7616 compliance
 	authMu    sync.Mutex
 	ncCounter uint32
@@ -83,6 +86,9 @@ func (c *Client) Start() {
 				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 				if err := c.Register(ctx); err != nil {
 					fmt.Printf("Periodic registration failed: %v\n", err)
+					if c.OnError != nil {
+						c.OnError(fmt.Errorf("SIP Registration failed: %w", err))
+					}
 
 					// RFC-compliant backoff: double the delay on failure to avoid flooding SBC during IP bans
 					delay *= 2
