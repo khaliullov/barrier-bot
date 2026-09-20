@@ -611,7 +611,13 @@ func (b *Bot) showUserManagement(chatID int64, userID int64, messageID int, barr
 		u, ok := b.store.GetUser(a.UserID)
 		name := fmt.Sprintf("ID: %d", a.UserID)
 		if ok {
-			name = fmt.Sprintf("%s (@%s)", u.FullName, u.Username)
+			if u.FullName != "" && u.Username != "" {
+				name = fmt.Sprintf("%s (@%s)", u.FullName, u.Username)
+			} else if u.FullName != "" {
+				name = u.FullName
+			} else if u.Username != "" {
+				name = fmt.Sprintf("@%s", u.Username)
+			}
 		}
 		expiresStr := "Бессрочно"
 		if !a.ExpiresAt.IsZero() {
@@ -653,7 +659,13 @@ func (b *Bot) showAdminManagement(chatID int64, userID int64, messageID int, bar
 		u, ok := b.store.GetUser(a.UserID)
 		name := fmt.Sprintf("ID: %d", a.UserID)
 		if ok {
-			name = fmt.Sprintf("%s (@%s)", u.FullName, u.Username)
+			if u.FullName != "" && u.Username != "" {
+				name = fmt.Sprintf("%s (@%s)", u.FullName, u.Username)
+			} else if u.FullName != "" {
+				name = u.FullName
+			} else if u.Username != "" {
+				name = fmt.Sprintf("@%s", u.Username)
+			}
 		}
 		btn := tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("%s (%s) 🗑", name, a.Role), fmt.Sprintf("rem_admin_%s_%d", barrierID, a.UserID))
 		rows = append(rows, tgbotapi.NewInlineKeyboardRow(btn))
@@ -880,20 +892,21 @@ func (b *Bot) handleStateInput(msg *tgbotapi.Message, sess Session) {
 		var targetID int64
 		var targetUser string
 
-		if strings.HasPrefix(text, "@") {
-			targetUser = text[1:]
-			u, ok := b.store.GetUserByUsername(targetUser)
+		cleanText := strings.TrimPrefix(text, "@")
+		id, err := strconv.ParseInt(text, 10, 64)
+		if err == nil {
+			targetID = id
+			u, ok := b.store.GetUser(id)
 			if ok {
-				targetID = u.TelegramID
+				targetUser = u.Username
 			}
 		} else {
-			id, err := strconv.ParseInt(text, 10, 64)
-			if err == nil {
-				targetID = id
-				u, ok := b.store.GetUser(id)
-				if ok {
-					targetUser = u.Username
-				}
+			targetUser = cleanText
+			u, ok := b.store.GetUserByUsername(cleanText)
+			if ok {
+				targetID = u.TelegramID
+			} else {
+				targetID = b.store.NextPendingUserID()
 			}
 		}
 
@@ -943,14 +956,12 @@ func (b *Bot) handleStateInput(msg *tgbotapi.Message, sess Session) {
 }
 
 func (b *Bot) confirmAddGuest(chatID int64, userID int64, sess Session) {
-	b.store.UpsertUser(config.User{
+	expiresAt := time.Now().Add(24 * time.Hour)
+	err := b.store.GrantUserAccess(config.User{
 		TelegramID: sess.TargetID,
 		Username:   sess.TargetUser,
 		FullName:   sess.TargetName,
-	})
-
-	expiresAt := time.Now().Add(24 * time.Hour)
-	err := b.store.GrantAccess(userID, sess.TargetID, sess.BarrierID, expiresAt, config.AccessTypeGuest)
+	}, userID, sess.BarrierID, expiresAt, config.AccessTypeGuest)
 	if err != nil {
 		b.showError(chatID, sess.LastMenuID, "❌ Ошибка добавления гостя.")
 	} else {
@@ -1023,13 +1034,11 @@ func (b *Bot) handleExpirationSelection(chatID int64, userID int64, messageID in
 		expiresAt = time.Time{}
 	}
 
-	b.store.UpsertUser(config.User{
+	err := b.store.GrantUserAccess(config.User{
 		TelegramID: sess.TargetID,
 		Username:   sess.TargetUser,
 		FullName:   sess.TargetName,
-	})
-
-	err := b.store.GrantAccess(userID, sess.TargetID, sess.BarrierID, expiresAt, config.AccessTypeUser)
+	}, userID, sess.BarrierID, expiresAt, config.AccessTypeUser)
 	if err != nil {
 		b.showError(chatID, messageID, "❌ Ошибка добавления пользователя.")
 	} else {
@@ -1057,7 +1066,7 @@ func (b *Bot) handleExpirationSelection(chatID int64, userID int64, messageID in
 		text := fmt.Sprintf("✅ Пользователь добавлен!\nИмя: %s\nСрок: %s\nШлагбаум: %s", barrierDisplay, expireText, barrierName)
 		b.editMessageWithBack(chatID, messageID, text, "main_menu")
 
-		if sess.RequestID != "" {
+		if sess.RequestID != "" && sess.TargetID > 0 {
 			b.store.UpdateAccessRequestStatus(sess.RequestID, "APPROVED")
 			admin, _ := b.store.GetUser(userID)
 			adminDisplay := admin.FullName
@@ -1097,13 +1106,11 @@ func (b *Bot) confirmAddAdminSPA(chatID int64, userID int64, sess Session) {
 		return
 	}
 
-	b.store.UpsertUser(config.User{
+	err := b.store.AddAdminUser(config.User{
 		TelegramID: sess.TargetID,
 		Username:   sess.TargetUser,
 		FullName:   sess.TargetName,
-	})
-
-	err := b.store.AddAdmin(userID, sess.TargetID, sess.BarrierID, config.RoleBarrierAdmin)
+	}, userID, sess.BarrierID, config.RoleBarrierAdmin)
 	if err != nil {
 		b.showError(chatID, sess.LastMenuID, "❌ Ошибка добавления администратора.")
 	} else {

@@ -233,6 +233,32 @@ func (m *Manager) migrate() {
 		}
 	}
 
+	// Migrate users with TelegramID == 0 to unique negative pending IDs
+	minPendingID := int64(0)
+	for _, u := range m.cfg.Users {
+		if u.TelegramID < minPendingID {
+			minPendingID = u.TelegramID
+		}
+	}
+	for i, u := range m.cfg.Users {
+		if u.TelegramID == 0 {
+			minPendingID--
+			newID := minPendingID
+			m.cfg.Users[i].TelegramID = newID
+			for j, a := range m.cfg.Accesses {
+				if a.UserID == 0 {
+					m.cfg.Accesses[j].UserID = newID
+				}
+			}
+			for j, adm := range m.cfg.Admins {
+				if adm.UserID == 0 {
+					m.cfg.Admins[j].UserID = newID
+				}
+			}
+			changed = true
+		}
+	}
+
 	if changed {
 		m.cfg.OldBarrierUsers = nil
 		m.cfg.OldAdminPermissions = nil
@@ -277,26 +303,6 @@ func (m *Manager) cleanupLocked() {
 		activeAnon = append(activeAnon, a)
 	}
 	m.cfg.AnonymousAccesses = activeAnon
-
-	// 2. Remove orphaned users
-	referencedUsers := make(map[int64]bool)
-	referencedUsers[m.cfg.MasterAdminID] = true
-	for _, a := range m.cfg.Accesses {
-		referencedUsers[a.UserID] = true
-		referencedUsers[a.CreatedBy] = true
-	}
-	for _, adm := range m.cfg.Admins {
-		referencedUsers[adm.UserID] = true
-		referencedUsers[adm.CreatedBy] = true
-	}
-
-	var activeUsers []User
-	for _, u := range m.cfg.Users {
-		if referencedUsers[u.TelegramID] {
-			activeUsers = append(activeUsers, u)
-		}
-	}
-	m.cfg.Users = activeUsers
 
 	// 3. Enforce ring buffer size 10 for audit_logs
 	activeBarriers := make(map[string]bool)

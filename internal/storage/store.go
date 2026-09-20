@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/khaliullov/barrier-bot/internal/config"
@@ -171,22 +172,37 @@ func (s *Store) IsGuestOnly(userID int64) bool {
 	return isGuest
 }
 
+func (s *Store) NextPendingUserID() int64 {
+	cfg := s.manager.Config()
+	minID := int64(0)
+	for _, u := range cfg.Users {
+		if u.TelegramID < minID {
+			minID = u.TelegramID
+		}
+	}
+	for _, a := range cfg.Accesses {
+		if a.UserID < minID {
+			minID = a.UserID
+		}
+	}
+	for _, adm := range cfg.Admins {
+		if adm.UserID < minID {
+			minID = adm.UserID
+		}
+	}
+	return minID - 1
+}
+
 func (s *Store) GetUserByUsername(username string) (config.User, bool) {
 	if username == "" {
 		return config.User{}, false
 	}
-	cleanUsername := username
-	if cleanUsername[0] == '@' {
-		cleanUsername = cleanUsername[1:]
-	}
+	cleanUsername := strings.TrimPrefix(username, "@")
 
 	cfg := s.manager.Config()
 	for _, u := range cfg.Users {
-		uClean := u.Username
-		if len(uClean) > 0 && uClean[0] == '@' {
-			uClean = uClean[1:]
-		}
-		if uClean == cleanUsername {
+		uClean := strings.TrimPrefix(u.Username, "@")
+		if strings.EqualFold(uClean, cleanUsername) {
 			return u, true
 		}
 	}
@@ -195,65 +211,163 @@ func (s *Store) GetUserByUsername(username string) (config.User, bool) {
 
 func (s *Store) UpsertUser(user config.User) error {
 	return s.manager.Update(func(cfg *config.Config) {
-		var existingUserIndex = -1
+		s.upsertUserLocked(cfg, user)
+	})
+}
 
-		// 1. Пытаемся найти пользователя по ID или по Username
-		for i, u := range cfg.Users {
-			if u.TelegramID != 0 && u.TelegramID == user.TelegramID {
-				existingUserIndex = i
-				break
-			}
-			if u.Username != "" && u.Username == user.Username {
-				existingUserIndex = i
-				break
+func (s *Store) upsertUserLocked(cfg *config.Config, user config.User) {
+	cleanUsername := strings.TrimPrefix(user.Username, "@")
+	if cleanUsername != "" {
+		user.Username = cleanUsername
+	}
+
+	var userByIDIndex = -1
+	var pendingUserIndex = -1
+
+	for i, u := range cfg.Users {
+		if user.TelegramID != 0 && u.TelegramID == user.TelegramID {
+			userByIDIndex = i
+		}
+		uClean := strings.TrimPrefix(u.Username, "@")
+		if cleanUsername != "" && strings.EqualFold(uClean, cleanUsername) && u.TelegramID <= 0 {
+			pendingUserIndex = i
+		}
+	}
+
+	// Case 1: Real telegram user logged in, and there was a pending user record with their username
+	if user.TelegramID > 0 && pendingUserIndex != -1 {
+		oldID := cfg.Users[pendingUserIndex].TelegramID
+		newID := user.TelegramID
+
+		// Migrate accesses
+		for j, a := range cfg.Accesses {
+			if a.UserID == oldID {
+				cfg.Accesses[j].UserID = newID
 			}
 		}
 
-		if existingUserIndex != -1 {
-			existingUser := &cfg.Users[existingUserIndex]
-
-			// Если у найденного пользователя был ID 0, а теперь мы получили реальный ID
-			if existingUser.TelegramID == 0 && user.TelegramID != 0 {
-				oldID := int64(0)
-				newID := user.TelegramID
-
-				// Обновляем самого пользователя
-				existingUser.TelegramID = newID
-
-				// 2. Обновляем все записи в Accesses, где был ID 0
-				for j, a := range cfg.Accesses {
-					if a.UserID == oldID {
-						cfg.Accesses[j].UserID = newID
-					}
-				}
-
-				// 3. Обновляем все записи в Administrators
-				for j, adm := range cfg.Admins {
-					if adm.UserID == oldID {
-						cfg.Admins[j].UserID = newID
-					}
-				}
+		// Migrate admins
+		for j, adm := range cfg.Admins {
+			if adm.UserID == oldID {
+				cfg.Admins[j].UserID = newID
 			}
+		}
 
-			// Обновляем остальные данные
+		if userByIDIndex != -1 && userByIDIndex != pendingUserIndex {
+			// Real user record already existed separately, merge and remove pending
 			if user.Username != "" {
-				existingUser.Username = user.Username
+				cfg.Users[userByIDIndex].Username = user.Username
 			}
 			if user.FullName != "" {
-				existingUser.FullName = user.FullName
+				cfg.Users[userByIDIndex].FullName = user.FullName
 			}
-			if existingUser.WebToken == "" {
-				existingUser.WebToken = generateToken()
+			cfg.Users = append(cfg.Users[:pendingUserIndex], cfg.Users[pendingUserIndex+1:]...)
+			return
+		}
+
+		// Update pending record to real ID
+		cfg.Users[pendingUserIndex].TelegramID = newID
+		if user.Username != "" {
+			cfg.Users[pendingUserIndex].Username = user.Username
+		}
+		if user.FullName != "" {
+			cfg.Users[pendingUserIndex].FullName = user.FullName
+		}
+		if cfg.Users[pendingUserIndex].WebToken == "" {
+			cfg.Users[pendingUserIndex].WebToken = generateToken()
+		}
+		return
+	}
+
+	// Case 2: Matching by TelegramID
+	if userByIDIndex != -1 {
+		existing := &cfg.Users[userByIDIndex]
+		if user.Username != "" {
+			existing.Username = user.Username
+		}
+		if user.FullName != "" {
+			existing.FullName = user.FullName
+		}
+		if existing.WebToken == "" {
+			existing.WebToken = generateToken()
+		}
+		return
+	}
+
+	// Case 3: Matching pending user by username (when user.TelegramID <= 0)
+	if pendingUserIndex != -1 {
+		existing := &cfg.Users[pendingUserIndex]
+		if user.TelegramID != 0 {
+			existing.TelegramID = user.TelegramID
+		}
+		if user.Username != "" {
+			existing.Username = user.Username
+		}
+		if user.FullName != "" {
+			existing.FullName = user.FullName
+		}
+		if existing.WebToken == "" {
+			existing.WebToken = generateToken()
+		}
+		return
+	}
+
+	// Case 4: Brand new user
+	if user.CreatedAt.IsZero() {
+		user.CreatedAt = time.Now()
+	}
+	if user.WebToken == "" {
+		user.WebToken = generateToken()
+	}
+	cfg.Users = append(cfg.Users, user)
+}
+
+func (s *Store) GrantUserAccess(user config.User, adminID int64, barrierID string, expiresAt time.Time, accType config.AccessType) error {
+	return s.manager.Update(func(cfg *config.Config) {
+		s.upsertUserLocked(cfg, user)
+		found := false
+		for i, a := range cfg.Accesses {
+			if a.UserID == user.TelegramID && a.BarrierID == barrierID && a.Type == accType {
+				cfg.Accesses[i].ExpiresAt = expiresAt
+				cfg.Accesses[i].CreatedBy = adminID
+				found = true
+				break
 			}
-		} else {
-			// Новый пользователь
-			if user.CreatedAt.IsZero() {
-				user.CreatedAt = time.Now()
+		}
+		if !found {
+			cfg.Accesses = append(cfg.Accesses, config.Access{
+				ID:        fmt.Sprintf("%d_%s_%d", user.TelegramID, barrierID, time.Now().Unix()),
+				UserID:    user.TelegramID,
+				BarrierID: barrierID,
+				Type:      accType,
+				ExpiresAt: expiresAt,
+				CreatedBy: adminID,
+				CreatedAt: time.Now(),
+			})
+		}
+	})
+}
+
+func (s *Store) AddAdminUser(user config.User, createdBy int64, barrierID string, role config.Role) error {
+	return s.manager.Update(func(cfg *config.Config) {
+		s.upsertUserLocked(cfg, user)
+		found := false
+		for i, a := range cfg.Admins {
+			if a.UserID == user.TelegramID && a.BarrierID == barrierID {
+				cfg.Admins[i].Role = role
+				cfg.Admins[i].CreatedBy = createdBy
+				found = true
+				break
 			}
-			if user.WebToken == "" {
-				user.WebToken = generateToken()
-			}
-			cfg.Users = append(cfg.Users, user)
+		}
+		if !found {
+			cfg.Admins = append(cfg.Admins, config.Admin{
+				UserID:    user.TelegramID,
+				BarrierID: barrierID,
+				Role:      role,
+				CreatedBy: createdBy,
+				CreatedAt: time.Now(),
+			})
 		}
 	})
 }
